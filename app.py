@@ -27,8 +27,9 @@ image = (
 
 hf_cache = modal.Volume.from_name("aletheia-hf-cache", create_if_missing=True)
 
-# Cheapest available GPUs, with fallback
-GPU_CONFIG = ["T4", "L4"]
+# L4 (24 GB) gives headroom for current 7 detectors plus a future heavy
+# detector like Binoculars. A10G as fallback for the same VRAM tier.
+GPU_CONFIG = ["L4", "A10G"]
 
 
 class DetectRequest(BaseModel):
