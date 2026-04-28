@@ -46,9 +46,19 @@ MODELS_META = {
         "description": "RoBERTa-large adversarially trained against Vicuna-7B paraphrases (TrustSafeAI); paraphrase-robust.",
         "window_tokens": 512,
     },
+    "binoculars": {
+        "description": "Zero-shot detector via ratio of Falcon-7B perplexities (Hans et al., 2024); bf16.",
+        "window_tokens": 1024,
+    },
 }
 
-TRAINED_NAMES = list(MODELS_META.keys())
+# Routing: each name belongs to exactly one GPU service.
+TRAINED_NAMES = [
+    "fakespot", "szeged", "desklib",
+    "superannotate_low_fpr", "superannotate",
+    "mage", "radar",
+]
+BINOCULARS_NAMES = ["binoculars"]
 
 # ---------------------------------------------------------------------------
 # Images
@@ -66,6 +76,20 @@ detector_image = (
         "markdown",
         "beautifulsoup4",
         "safetensors",
+    )
+    .add_local_dir(".", remote_path="/root")
+)
+
+# Binoculars runs the dual Falcon-7B pair in fp16 on a 40 GB GPU.
+binoculars_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .uv_pip_install(
+        "torch",
+        "transformers",
+        "accelerate",
+        "huggingface_hub",
+        "numpy",
+        "pydantic",
     )
     .add_local_dir(".", remote_path="/root")
 )
@@ -163,6 +187,38 @@ class DetectorService:
 
 
 # ---------------------------------------------------------------------------
+# Binoculars service (GPU, separate image with bitsandbytes)
+# ---------------------------------------------------------------------------
+
+@app.cls(
+    image=binoculars_image,
+    gpu=["A100", "L40S"],
+    volumes={"/hf-cache": hf_cache},
+    timeout=900,
+    scaledown_window=10 * 60,
+    max_containers=1,
+)
+class BinocularsService:
+    @modal.enter()
+    def load(self):
+        import os
+        os.environ["HF_HOME"] = "/hf-cache"
+
+        import torch
+        from binoculars import BinocularsDetector
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Loading Binoculars on {device}...")
+        self.detector = BinocularsDetector(device)
+        self.detector.load()
+        print("Binoculars ready.")
+
+    @modal.method()
+    def detect(self, text: str) -> dict:
+        return {"binoculars": self.detector.predict(text).model_dump()}
+
+
+# ---------------------------------------------------------------------------
 # Web dispatcher (no GPU)
 # ---------------------------------------------------------------------------
 
@@ -188,15 +244,27 @@ def web():
 
     @api.post("/detect", response_model=DetectResponse)
     async def detect(req: DetectRequest):
+        import asyncio
+
         names = req.models or list(MODELS_META.keys())
         unknown = [n for n in names if n not in MODELS_META]
         if unknown:
             raise HTTPException(400, detail=f"Unknown models: {unknown}")
 
         trained = [n for n in names if n in TRAINED_NAMES]
-        results = {}
+        bino = [n for n in names if n in BINOCULARS_NAMES]
+
+        # Run the two services concurrently via Modal's async interface.
+        # A request that names only one kind never wakes the other.
+        tasks = []
         if trained:
-            results.update(DetectorService().detect.remote(req.text, trained))
+            tasks.append(DetectorService().detect.remote.aio(req.text, trained))
+        if bino:
+            tasks.append(BinocularsService().detect.remote.aio(req.text))
+
+        results = {}
+        for r in await asyncio.gather(*tasks):
+            results.update(r)
         return DetectResponse(results=results)
 
     return api
