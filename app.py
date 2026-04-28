@@ -16,6 +16,8 @@ image = (
         "fastapi",
         "numpy",
         "pydantic",
+        "markdown",
+        "beautifulsoup4",
     )
     .add_local_dir(".", remote_path="/root")
 )
@@ -49,7 +51,15 @@ class DetectorService:
         os.environ["HF_HOME"] = "/hf-cache"
 
         import torch
-        from detectors import DesklibDetector, FakespotDetector, SzegedDetector
+        from detectors import (
+            DesklibDetector,
+            FakespotDetector,
+            MageDetector,
+            RadarDetector,
+            SuperAnnotateDetector,
+            SuperAnnotateLowFprDetector,
+            SzegedDetector,
+        )
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self._device = device
@@ -61,6 +71,10 @@ class DetectorService:
                 FakespotDetector(device),
                 SzegedDetector(device),
                 DesklibDetector(device),
+                SuperAnnotateLowFprDetector(device),
+                SuperAnnotateDetector(device),
+                MageDetector(device),
+                RadarDetector(device),
             ]
         }
 
