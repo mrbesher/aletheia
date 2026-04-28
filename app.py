@@ -2,7 +2,10 @@ import os
 
 import modal
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+MIN_WORDS = 40
+MAX_WORDS = 5000
 
 app = modal.App("aletheia-detector")
 
@@ -31,6 +34,17 @@ GPU_CONFIG = ["T4", "L4"]
 class DetectRequest(BaseModel):
     text: str
     models: list[str] | None = None
+
+    @field_validator("text")
+    @classmethod
+    def _check_length(cls, v: str) -> str:
+        words = len(v.split())
+        if words < MIN_WORDS or words > MAX_WORDS:
+            raise ValueError(
+                f"Text has {words} words. Need {MIN_WORDS}-{MAX_WORDS} words "
+                f"(word count is whitespace-split, approximate for CJK)."
+            )
+        return v
 
 
 class DetectResponse(BaseModel):
