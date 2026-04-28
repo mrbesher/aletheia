@@ -51,6 +51,7 @@ def _aggregate(scores: List[float], threshold: float) -> tuple[float, str]:
 
 class BaseDetector(abc.ABC):
     name: str
+    description: str
     threshold: float = 0.5
 
     def __init__(self, device: str):
@@ -86,6 +87,7 @@ class _ChunkingDetector(BaseDetector):
 
 class FakespotDetector(_ChunkingDetector):
     name = "fakespot"
+    description = "RoBERTa-base binary AI detector (Fakespot)."
     max_tokens = 512
     stride = 128
 
@@ -123,6 +125,7 @@ class FakespotDetector(_ChunkingDetector):
 
 class SzegedDetector(_ChunkingDetector):
     name = "szeged"
+    description = "Three-seed ModernBERT ensemble, 41-class LLM-family classifier (SzegedAI); reports 1 minus P(human)."
     max_tokens = 2048
     stride = 256
 
@@ -197,6 +200,7 @@ class SzegedDetector(_ChunkingDetector):
 
 class DesklibDetector(_ChunkingDetector):
     name = "desklib"
+    description = "Mean-pooled transformer with single-logit AI head (Desklib)."
     max_tokens = 768
     stride = 192
 
@@ -350,11 +354,13 @@ class _SuperAnnotateBase(_ChunkingDetector):
 
 class SuperAnnotateLowFprDetector(_SuperAnnotateBase):
     name = "superannotate_low_fpr"
+    description = "RoBERTa-large detector tuned for low false-positive rate (SuperAnnotate)."
     model_id = "SuperAnnotate/ai-detector-low-fpr"
 
 
 class SuperAnnotateDetector(_SuperAnnotateBase):
     name = "superannotate"
+    description = "RoBERTa-large balanced AI detector (SuperAnnotate)."
     model_id = "SuperAnnotate/ai-detector"
 
 
@@ -365,6 +371,7 @@ class SuperAnnotateDetector(_SuperAnnotateBase):
 
 class MageDetector(_ChunkingDetector):
     name = "mage"
+    description = "Longformer trained on MAGE corpus, 27 LLMs across 7 tasks (ACL 2024)."
     max_tokens = 4096
     stride = 512
 
@@ -417,6 +424,7 @@ class MageDetector(_ChunkingDetector):
 
 class RadarDetector(_ChunkingDetector):
     name = "radar"
+    description = "RoBERTa-large adversarially trained against Vicuna-7B paraphrases (TrustSafeAI); paraphrase-robust."
     max_tokens = 512
     stride = 128
 

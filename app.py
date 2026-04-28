@@ -117,7 +117,17 @@ class DetectorService:
 
         @api.get("/models")
         async def list_models():
-            return {"models": list(self.detectors.keys())}
+            return {
+                "score_format": "P(AI) in [0,1]; >= 0.5 means AI Generated",
+                "models": [
+                    {
+                        "name": d.name,
+                        "description": d.description,
+                        "window_tokens": d.max_tokens,
+                    }
+                    for d in self.detectors.values()
+                ],
+            }
 
         @api.post("/detect", response_model=DetectResponse)
         async def detect_endpoint(req: DetectRequest):
