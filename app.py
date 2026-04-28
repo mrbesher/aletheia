@@ -1,36 +1,84 @@
-import os
-
 import modal
-from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator
+
+# ---------------------------------------------------------------------------
+# App + storage
+# ---------------------------------------------------------------------------
+
+app = modal.App("aletheia-detector")
+hf_cache = modal.Volume.from_name("aletheia-hf-cache", create_if_missing=True)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 MIN_WORDS = 40
 MAX_WORDS = 5000
 
-app = modal.App("aletheia-detector")
+# Static catalog. Lives at module scope so the (torch-free) web container can
+# answer /models and route /detect without booting any GPU service.
+MODELS_META = {
+    "fakespot": {
+        "description": "RoBERTa-base binary AI detector (Fakespot).",
+        "window_tokens": 512,
+    },
+    "szeged": {
+        "description": "Three-seed ModernBERT ensemble, 41-class LLM-family classifier (SzegedAI); reports 1 minus P(human).",
+        "window_tokens": 2048,
+    },
+    "desklib": {
+        "description": "Mean-pooled transformer with single-logit AI head (Desklib).",
+        "window_tokens": 768,
+    },
+    "superannotate_low_fpr": {
+        "description": "RoBERTa-large detector tuned for low false-positive rate (SuperAnnotate).",
+        "window_tokens": 512,
+    },
+    "superannotate": {
+        "description": "RoBERTa-large balanced AI detector (SuperAnnotate).",
+        "window_tokens": 512,
+    },
+    "mage": {
+        "description": "Longformer trained on MAGE corpus, 27 LLMs across 7 tasks (ACL 2024).",
+        "window_tokens": 4096,
+    },
+    "radar": {
+        "description": "RoBERTa-large adversarially trained against Vicuna-7B paraphrases (TrustSafeAI); paraphrase-robust.",
+        "window_tokens": 512,
+    },
+}
 
-image = (
+TRAINED_NAMES = list(MODELS_META.keys())
+
+# ---------------------------------------------------------------------------
+# Images
+# ---------------------------------------------------------------------------
+
+detector_image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install(
         "torch",
         "transformers",
         "accelerate",
         "huggingface_hub",
-        "fastapi",
         "numpy",
         "pydantic",
         "markdown",
         "beautifulsoup4",
+        "safetensors",
     )
     .add_local_dir(".", remote_path="/root")
 )
 
-hf_cache = modal.Volume.from_name("aletheia-hf-cache", create_if_missing=True)
+# CPU-only dispatcher image: just FastAPI + pydantic.
+web_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .uv_pip_install("fastapi", "pydantic")
+)
 
-# L4 (24 GB) gives headroom for current 7 detectors plus a future heavy
-# detector like Binoculars. A10G as fallback for the same VRAM tier.
-GPU_CONFIG = ["L4", "A10G"]
-
+# ---------------------------------------------------------------------------
+# Request / response schemas
+# ---------------------------------------------------------------------------
 
 class DetectRequest(BaseModel):
     text: str
@@ -52,9 +100,13 @@ class DetectResponse(BaseModel):
     results: dict
 
 
+# ---------------------------------------------------------------------------
+# Trained-detector service (GPU)
+# ---------------------------------------------------------------------------
+
 @app.cls(
-    image=image,
-    gpu=GPU_CONFIG,
+    image=detector_image,
+    gpu=["L4", "A10G"],
     volumes={"/hf-cache": hf_cache},
     timeout=600,
     scaledown_window=20 * 60,
@@ -63,6 +115,7 @@ class DetectResponse(BaseModel):
 class DetectorService:
     @modal.enter()
     def load(self):
+        import os
         os.environ["HF_HOME"] = "/hf-cache"
 
         import torch
@@ -77,7 +130,6 @@ class DetectorService:
         )
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._device = device
         print(f"Using device: {device}")
 
         self.detectors = {
@@ -92,84 +144,73 @@ class DetectorService:
                 RadarDetector(device),
             ]
         }
-
-        for detector in list(self.detectors.values()):
-            print(f"Loading {detector.name}...")
+        for d in list(self.detectors.values()):
+            print(f"Loading {d.name}...")
             try:
-                detector.load()
-                print(f"{detector.name} ready.")
+                d.load()
+                print(f"{d.name} ready.")
             except Exception as e:
-                print(f"FAILED to load {detector.name}: {e}")
-                del self.detectors[detector.name]
+                print(f"FAILED to load {d.name}: {e}")
+                del self.detectors[d.name]
 
     @modal.method()
-    def detect(self, text: str, model_names: list[str] | None = None) -> dict:
-        names = model_names or list(self.detectors.keys())
-        invalid = [n for n in names if n not in self.detectors]
-        if invalid:
-            raise ValueError(
-                f"Unknown models: {invalid}. Available: {list(self.detectors.keys())}"
-            )
-
-        # Sequential execution to keep resource usage predictable on a cheap GPU
+    def detect(self, text: str, names: list[str]) -> dict:
         results = {}
         for name in names:
-            result = self.detectors[name].predict(text)
-            results[name] = result.model_dump()
+            if name in self.detectors:
+                results[name] = self.detectors[name].predict(text).model_dump()
         return results
 
-    @modal.asgi_app(requires_proxy_auth=True)
-    def web(self):
-        api = FastAPI(title="Aletheia Detector")
 
-        @api.get("/health")
-        async def health():
-            return {
-                "status": "ok",
-                "available_models": list(self.detectors.keys()),
-                "device": self._device,
-            }
+# ---------------------------------------------------------------------------
+# Web dispatcher (no GPU)
+# ---------------------------------------------------------------------------
 
-        @api.get("/models")
-        async def list_models():
-            return {
-                "score_format": "P(AI) in [0,1]; >= 0.5 means AI Generated",
-                "models": [
-                    {
-                        "name": d.name,
-                        "description": d.description,
-                        "window_tokens": d.max_tokens,
-                    }
-                    for d in self.detectors.values()
-                ],
-            }
+@app.function(image=web_image, scaledown_window=20 * 60)
+@modal.asgi_app(requires_proxy_auth=True)
+def web():
+    from fastapi import FastAPI, HTTPException
 
-        @api.post("/detect", response_model=DetectResponse)
-        async def detect_endpoint(req: DetectRequest):
-            try:
-                names = req.models or list(self.detectors.keys())
-                invalid = [n for n in names if n not in self.detectors]
-                if invalid:
-                    raise HTTPException(
-                        status_code=400, detail=f"Unknown models: {invalid}"
-                    )
+    api = FastAPI(title="Aletheia Detector")
 
-                results = {}
-                for name in names:
-                    results[name] = self.detectors[name].predict(req.text).model_dump()
-                return DetectResponse(results=results)
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
+    @api.get("/health")
+    async def health():
+        return {"status": "ok", "models": list(MODELS_META.keys())}
 
-        return api
+    @api.get("/models")
+    async def list_models():
+        return {
+            "score_format": "P(AI) in [0,1]; >= 0.5 means AI Generated",
+            "models": [
+                {"name": name, **meta} for name, meta in MODELS_META.items()
+            ],
+        }
 
+    @api.post("/detect", response_model=DetectResponse)
+    async def detect(req: DetectRequest):
+        names = req.models or list(MODELS_META.keys())
+        unknown = [n for n in names if n not in MODELS_META]
+        if unknown:
+            raise HTTPException(400, detail=f"Unknown models: {unknown}")
+
+        trained = [n for n in names if n in TRAINED_NAMES]
+        results = {}
+        if trained:
+            results.update(DetectorService().detect.remote(req.text, trained))
+        return DetectResponse(results=results)
+
+    return api
+
+
+# ---------------------------------------------------------------------------
+# Local CLI (one-model smoke test)
+# ---------------------------------------------------------------------------
 
 @app.local_entrypoint()
 def main(
     text: str = "This is a test sentence generated by an AI model to demonstrate capabilities.",
     model: str = "fakespot",
 ):
-    """Run a quick remote test against a single model."""
     print(f"Testing model: {model}")
     result = DetectorService().detect.remote(text, [model])
     print(f"Result: {result}")
