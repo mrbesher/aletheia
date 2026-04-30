@@ -1,38 +1,44 @@
-# Aletheia Detector
+# Aletheia
 
-AI-text detection API running on Modal. Evaluates text against multiple detectors and returns verdicts.
+AI-text detection API. Runs locally or on [Modal](https://modal.com).
 
-## Quick start
+## Run
 
-Test a single model remotely:
+Local (needs a CUDA GPU):
+
 ```bash
-modal run app.py --model fakespot
+uv sync
+uv run app.py
 ```
 
-Deploy:
+Modal:
+
 ```bash
 modal deploy app.py
 ```
 
 ## API
 
-- `GET /health` - service status and available models
-- `GET /models` - list available detectors
-- `POST /detect` - run detection
-  ```json
-  {
-    "text": "Text to analyze",
-    "models": ["fakespot"] // optional; omit to run all
-  }
-  ```
+```
+GET  /health   service status, model list
+GET  /models   description and token window per model
+POST /detect   { "text": "...", "models": ["fakespot"] }
+```
 
-## Adding a detector
+`models` is optional; omit to run all.
 
-1. Subclass `BaseDetector` in `detectors.py`
-2. Implement `load()` and `predict()`
-3. Register it in `DetectorService.load()` inside `app.py`
+Score: `P(AI) ∈ [0, 1]`, `>= 0.5` means AI Generated. Text must be 40-5000 whitespace-split words.
 
-## Architecture
+## Add a detector
 
-- `app.py` - Modal app + FastAPI endpoints
-- `detectors.py` - detector implementations and shared chunking logic
+1. Subclass `BaseDetector` in `detectors.py`.
+2. Add a `Model(...)` row to `MODELS` in `app.py`.
+3. Append the class to `load_trained` in `app.py`.
+
+## Layout
+
+```
+app.py          API, engines, Modal services
+detectors.py    trained detectors
+binoculars.py   Binoculars detector
+```

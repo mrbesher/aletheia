@@ -1,0 +1,19 @@
+[project]
+name = "aletheia"
+version = "0.1.0"
+description = "Multi-model AI text detection API."
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate",
+    "beautifulsoup4",
+    "fastapi",
+    "huggingface_hub",
+    "markdown",
+    "modal",
+    "numpy",
+    "pydantic",
+    "safetensors",
+    "torch",
+    "transformers",
+    "uvicorn[standard]",
+]
