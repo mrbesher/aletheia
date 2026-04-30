@@ -2,7 +2,6 @@ import abc
 import re
 from typing import Any, List
 
-import numpy as np
 import torch
 import torch.nn as nn
 from pydantic import BaseModel
@@ -19,15 +18,17 @@ from transformers import (
 class DetectorResult(BaseModel):
     label: str
     score: float
+    score_std: float
     windows: int
+    details: dict | None = None
 
 
-def _chunk_text(text: str, tokenizer, max_tokens: int, stride: int) -> List[str]:
+def _chunk_text(text: str, tokenizer, max_tokens: int, stride: int) -> List[tuple[str, int]]:
     if not text or not text.strip():
         return []
     token_ids = tokenizer.encode(text, add_special_tokens=False)
     if len(token_ids) <= max_tokens:
-        return [text]
+        return [(text, len(token_ids))]
     step = max_tokens - stride
     windows = []
     for start in range(0, len(token_ids), step):
@@ -35,18 +36,20 @@ def _chunk_text(text: str, tokenizer, max_tokens: int, stride: int) -> List[str]
         piece = token_ids[start:end]
         if not piece:
             break
-        windows.append(tokenizer.decode(piece, skip_special_tokens=True))
+        windows.append((tokenizer.decode(piece, skip_special_tokens=True), len(piece)))
         if end >= len(token_ids):
             break
     return windows
 
 
-def _aggregate(scores: List[float], threshold: float) -> tuple[float, str]:
+def _aggregate(scores: List[float], weights: List[int], threshold: float) -> tuple[float, float, str]:
     if not scores:
-        return float("nan"), "unknown"
-    doc_score = float(np.mean(scores))
-    label = "AI Generated" if doc_score >= threshold else "Human"
-    return doc_score, label
+        return float("nan"), float("nan"), "unknown"
+    total = float(sum(weights))
+    mean = sum(s * w for s, w in zip(scores, weights)) / total
+    var = sum(w * (s - mean) ** 2 for s, w in zip(scores, weights)) / total
+    label = "AI Generated" if mean >= threshold else "Human"
+    return mean, var ** 0.5, label
 
 
 class BaseDetector(abc.ABC):
@@ -62,7 +65,7 @@ class BaseDetector(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def predict(self, text: str) -> DetectorResult:
+    def predict(self, text: str, verbose: bool = False) -> DetectorResult:
         ...
 
 
@@ -71,13 +74,23 @@ class _ChunkingDetector(BaseDetector):
     stride: int
     tokenizer: Any
 
-    def predict(self, text: str) -> DetectorResult:
+    def predict(self, text: str, verbose: bool = False) -> DetectorResult:
         windows = _chunk_text(text, self.tokenizer, self.max_tokens, self.stride)
-        scores = [self._predict_window(w) for w in windows]
-        score, label = _aggregate(scores, self.threshold)
-        return DetectorResult(label=label, score=score, windows=len(windows))
+        outputs = [self._predict_window(w) for w, _ in windows]
+        scores = [s for s, _ in outputs]
+        weights = [n for _, n in windows]
+        score, std, label = _aggregate(scores, weights, self.threshold)
+        details = None
+        if verbose and outputs:
+            details = {
+                "per_window": [
+                    {"score": s, "tokens": n, **(extras or {})}
+                    for (s, extras), n in zip(outputs, weights)
+                ]
+            }
+        return DetectorResult(label=label, score=score, score_std=std, windows=len(windows), details=details)
 
-    def _predict_window(self, text: str) -> float:
+    def _predict_window(self, text: str) -> tuple[float, dict | None]:
         raise NotImplementedError
 
 
@@ -109,14 +122,14 @@ class FakespotDetector(_ChunkingDetector):
         text = re.sub(r"\s+", " ", text).strip()
         return text
 
-    def _predict_window(self, text: str) -> float:
+    def _predict_window(self, text: str) -> tuple[float, dict | None]:
         cleaned = self._clean(text)
         out = self.pipe(cleaned)[0]
         label = str(out["label"]).lower()
         score = float(out["score"])
         if "ai" in label or label in {"label_1", "generated", "fake"}:
-            return score
-        return 1.0 - score if score <= 1.0 else score
+            return score, None
+        return (1.0 - score if score <= 1.0 else score), None
 
 
 # --------------------------------------------------------------------------- #
@@ -128,6 +141,24 @@ class SzegedDetector(_ChunkingDetector):
     description = "Three-seed ModernBERT ensemble, 41-class LLM-family classifier (SzegedAI); reports 1 minus P(human)."
     max_tokens = 2048
     stride = 256
+    FAMILY_LABELS = (
+        "13B", "30B", "65B", "7B", "GLM130B", "bloom_7b",
+        "bloomz", "cohere", "davinci", "dolly", "dolly-v2-12b",
+        "flan_t5_base", "flan_t5_large", "flan_t5_small",
+        "flan_t5_xl", "flan_t5_xxl", "gemma-7b-it", "gemma2-9b-it",
+        "gpt-3.5-turbo", "gpt-35", "gpt4", "gpt4o",
+        "gpt_j", "gpt_neox", "human", "llama3-70b", "llama3-8b",
+        "mixtral-8x7b", "opt_1.3b", "opt_125m", "opt_13b",
+        "opt_2.7b", "opt_30b", "opt_350m", "opt_6.7b",
+        "opt_iml_30b", "opt_iml_max_1.3b", "t0_11b", "t0_3b",
+        "text-davinci-002", "text-davinci-003",
+    )
+
+    def predict(self, text: str, verbose: bool = False) -> DetectorResult:
+        result = super().predict(text, verbose)
+        if verbose and result.details is not None:
+            result.details["family_labels"] = list(self.FAMILY_LABELS)
+        return result
 
     def load(self) -> None:
         from huggingface_hub import hf_hub_download
@@ -170,7 +201,7 @@ class SzegedDetector(_ChunkingDetector):
         return text.strip()
 
     @torch.inference_mode()
-    def _predict_window(self, text: str) -> float:
+    def _predict_window(self, text: str) -> tuple[float, dict | None]:
         text = self._clean(text)
         enc = self.tokenizer(
             text,
@@ -190,8 +221,9 @@ class SzegedDetector(_ChunkingDetector):
                 probs += torch.softmax(logits, dim=-1)
         probs = probs / len(self.models)
 
-        human_prob = float(probs.squeeze(0)[24].item())
-        return 1.0 - human_prob
+        p = probs.squeeze(0)
+        human_prob = float(p[24].item())
+        return 1.0 - human_prob, {"human_prob": human_prob, "family_probs": p.tolist()}
 
 
 # --------------------------------------------------------------------------- #
@@ -243,7 +275,7 @@ class DesklibDetector(_ChunkingDetector):
         self.model.eval()
 
     @torch.inference_mode()
-    def _predict_window(self, text: str) -> float:
+    def _predict_window(self, text: str) -> tuple[float, dict | None]:
         enc = self.tokenizer(
             text,
             padding="max_length",
@@ -253,8 +285,7 @@ class DesklibDetector(_ChunkingDetector):
         )
         enc = {k: v.to(self.device) for k, v in enc.items()}
         outputs = self.model(**enc)
-        prob_ai = torch.sigmoid(outputs["logits"]).item()
-        return float(prob_ai)
+        return float(torch.sigmoid(outputs["logits"]).item()), None
 
 
 # --------------------------------------------------------------------------- #
@@ -314,8 +345,8 @@ class _SuperAnnotateBase(_ChunkingDetector):
     stride = 128
     model_id: str = ""
 
-    def predict(self, text: str) -> DetectorResult:
-        return super().predict(_superannotate_preprocess(text))
+    def predict(self, text: str, verbose: bool = False) -> DetectorResult:
+        return super().predict(_superannotate_preprocess(text), verbose)
 
     def load(self) -> None:
         import json
@@ -338,7 +369,7 @@ class _SuperAnnotateBase(_ChunkingDetector):
         self.model.to(self.device).eval()
 
     @torch.inference_mode()
-    def _predict_window(self, text: str) -> float:
+    def _predict_window(self, text: str) -> tuple[float, dict | None]:
         enc = self.tokenizer(
             text,
             add_special_tokens=True,
@@ -349,7 +380,7 @@ class _SuperAnnotateBase(_ChunkingDetector):
         )
         enc = {k: v.to(self.device) for k, v in enc.items() if k != "token_type_ids"}
         logits = self.model(**enc)
-        return float(torch.sigmoid(logits).squeeze().item())
+        return float(torch.sigmoid(logits).squeeze().item()), None
 
 
 class SuperAnnotateLowFprDetector(_SuperAnnotateBase):
@@ -401,7 +432,7 @@ class MageDetector(_ChunkingDetector):
         self.model.eval()
 
     @torch.inference_mode()
-    def _predict_window(self, text: str) -> float:
+    def _predict_window(self, text: str) -> tuple[float, dict | None]:
         enc = self.tokenizer(
             text,
             truncation=True,
@@ -412,7 +443,7 @@ class MageDetector(_ChunkingDetector):
         enc = {k: v.to(self.device) for k, v in enc.items()}
         logits = self.model(**enc).logits
         # MAGE: index 0 is AI, index 1 is human
-        return float(torch.softmax(logits, dim=-1).squeeze(0)[0].item())
+        return float(torch.softmax(logits, dim=-1).squeeze(0)[0].item()), None
 
 
 # --------------------------------------------------------------------------- #
@@ -437,7 +468,7 @@ class RadarDetector(_ChunkingDetector):
         self.model.eval()
 
     @torch.inference_mode()
-    def _predict_window(self, text: str) -> float:
+    def _predict_window(self, text: str) -> tuple[float, dict | None]:
         enc = self.tokenizer(
             text,
             truncation=True,
@@ -448,4 +479,4 @@ class RadarDetector(_ChunkingDetector):
         enc = {k: v.to(self.device) for k, v in enc.items()}
         logits = self.model(**enc).logits
         # RADAR: index 0 is AI
-        return float(torch.softmax(logits, dim=-1).squeeze(0)[0].item())
+        return float(torch.softmax(logits, dim=-1).squeeze(0)[0].item()), None

@@ -32,6 +32,7 @@ MODELS: dict[str, Model] = {
 class DetectRequest(BaseModel):
     text: str
     models: list[str] | None = None
+    verbose: bool = False
 
     @field_validator("text")
     @classmethod
@@ -91,16 +92,16 @@ def split(names: list[str]) -> tuple[list[str], list[str]]:
     return trained, binoculars
 
 
-def run_trained(detectors: dict, text: str, names: list[str]) -> dict:
-    return {n: detectors[n].predict(text).model_dump() for n in names if n in detectors}
+def run_trained(detectors: dict, text: str, names: list[str], verbose: bool = False) -> dict:
+    return {n: detectors[n].predict(text, verbose).model_dump() for n in names if n in detectors}
 
 
-def run_binoculars(detector, text: str) -> dict:
-    return {"binoculars": detector.predict(text).model_dump()}
+def run_binoculars(detector, text: str, verbose: bool = False) -> dict:
+    return {"binoculars": detector.predict(text, verbose).model_dump()}
 
 
 class Engine(Protocol):
-    async def detect(self, text: str, names: list[str]) -> dict: ...
+    async def detect(self, text: str, names: list[str], verbose: bool = False) -> dict: ...
 
 
 class LocalEngine:
@@ -108,11 +109,11 @@ class LocalEngine:
         self.trained = load_trained(device)
         self.binoculars = load_binoculars(device)
 
-    async def detect(self, text: str, names: list[str]) -> dict:
+    async def detect(self, text: str, names: list[str], verbose: bool = False) -> dict:
         trained, binoculars = split(names)
         return {
-            **run_trained(self.trained, text, trained),
-            **(run_binoculars(self.binoculars, text) if binoculars else {}),
+            **run_trained(self.trained, text, trained, verbose),
+            **(run_binoculars(self.binoculars, text, verbose) if binoculars else {}),
         }
 
 
@@ -141,7 +142,7 @@ def create_api(engine: Engine):
         unknown = [n for n in names if n not in MODELS]
         if unknown:
             raise HTTPException(400, f"Unknown models: {unknown}")
-        return DetectResponse(results=await engine.detect(req.text, names))
+        return DetectResponse(results=await engine.detect(req.text, names, req.verbose))
 
     return api
 
@@ -183,8 +184,8 @@ class TrainedService:
         self.detectors = load_trained("cuda")
 
     @modal.method()
-    def detect(self, text: str, names: list[str]) -> dict:
-        return run_trained(self.detectors, text, names)
+    def detect(self, text: str, names: list[str], verbose: bool = False) -> dict:
+        return run_trained(self.detectors, text, names, verbose)
 
 
 @app.cls(
@@ -202,18 +203,18 @@ class BinocularsService:
         self.detector = load_binoculars("cuda")
 
     @modal.method()
-    def detect(self, text: str) -> dict:
-        return run_binoculars(self.detector, text)
+    def detect(self, text: str, verbose: bool = False) -> dict:
+        return run_binoculars(self.detector, text, verbose)
 
 
 class ModalEngine:
-    async def detect(self, text: str, names: list[str]) -> dict:
+    async def detect(self, text: str, names: list[str], verbose: bool = False) -> dict:
         trained, binoculars = split(names)
         calls = []
         if trained:
-            calls.append(TrainedService().detect.remote.aio(text, trained))
+            calls.append(TrainedService().detect.remote.aio(text, trained, verbose))
         if binoculars:
-            calls.append(BinocularsService().detect.remote.aio(text))
+            calls.append(BinocularsService().detect.remote.aio(text, verbose))
         merged: dict = {}
         for partial in await asyncio.gather(*calls):
             merged.update(partial)

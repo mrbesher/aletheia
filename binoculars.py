@@ -23,7 +23,9 @@ BINOCULARS_THRESHOLD = 0.9015310749276843
 class BinocularsResult(BaseModel):
     label: str
     score: float
+    score_std: float
     windows: int
+    details: dict | None = None
 
 
 def _perplexity(input_ids, attention_mask, logits):
@@ -83,17 +85,17 @@ class BinocularsDetector:
         self.observer.eval()
         self.performer.eval()
 
-    def _chunks(self, text: str) -> list[str]:
+    def _chunks(self, text: str) -> list[tuple[str, int]]:
         ids = self.tokenizer.encode(text, add_special_tokens=False)
         if len(ids) <= self.max_tokens:
-            return [text]
+            return [(text, len(ids))]
         step = self.max_tokens - self.stride
         out = []
         for start in range(0, len(ids), step):
             piece = ids[start : start + self.max_tokens]
             if not piece:
                 break
-            out.append(self.tokenizer.decode(piece, skip_special_tokens=True))
+            out.append((self.tokenizer.decode(piece, skip_special_tokens=True), len(piece)))
             if start + self.max_tokens >= len(ids):
                 break
         return out
@@ -118,11 +120,18 @@ class BinocularsDetector:
         p_ai = (self.threshold - score) / self.threshold + 0.5
         return max(0.0, min(1.0, p_ai))
 
-    def predict(self, text: str) -> BinocularsResult:
-        windows = self._chunks(text)
-        scores = [self._score_window(w) for w in windows]
-        if not scores:
-            return BinocularsResult(label="unknown", score=float("nan"), windows=0)
-        avg = sum(scores) / len(scores)
-        label = "AI Generated" if avg >= 0.5 else "Human"
-        return BinocularsResult(label=label, score=avg, windows=len(windows))
+    def predict(self, text: str, verbose: bool = False) -> BinocularsResult:
+        chunks = self._chunks(text)
+        if not chunks:
+            return BinocularsResult(label="unknown", score=float("nan"), score_std=float("nan"), windows=0)
+        scores = [self._score_window(t) for t, _ in chunks]
+        weights = [n for _, n in chunks]
+        total = float(sum(weights))
+        mean = sum(s * w for s, w in zip(scores, weights)) / total
+        var = sum(w * (s - mean) ** 2 for s, w in zip(scores, weights)) / total
+        label = "AI Generated" if mean >= 0.5 else "Human"
+        details = (
+            {"per_window": [{"score": s, "tokens": n} for s, n in zip(scores, weights)]}
+            if verbose else None
+        )
+        return BinocularsResult(label=label, score=mean, score_std=var ** 0.5, windows=len(scores), details=details)
