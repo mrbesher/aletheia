@@ -22,12 +22,12 @@ modal deploy app.py
 ```
 GET  /health   service status, model list
 GET  /models   description and token window per model
-POST /detect   { "text": "...", "models": ["fakespot"] }
+POST /detect   { "text": "...", "models": ["fakespot"], "verbose": false }
 ```
 
-`models` is optional; omit to run all.
+`models` is optional; omit to run all. `verbose` is optional.
 
-Score: `P(AI) ∈ [0, 1]`, `>= 0.5` means AI Generated. Text must be 40-5000 whitespace-split words.
+Score: `P(AI) ∈ [0, 1]`; `>= 0.5` means AI Generated. Each result includes `score`, `score_std`, and `windows`; set `verbose=true` to receive per-window `details`. Text must be 40-5000 whitespace-split words.
 
 ## Add a detector
 
